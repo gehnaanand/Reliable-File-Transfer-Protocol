@@ -83,13 +83,16 @@ void send_file(int server_socket, const char *filename, struct sockaddr_in *clie
 
   snprintf(path, MAX_PATH_LEN, "%s%s", folder, filename);
 
+  int sequence_number = 0;
   FILE *file = fopen(path, "rb");
   if (!file) {
+    snprintf(buffer, BUFSIZE, "Error: File not found");
+    sendto(server_socket, &sequence_number, sizeof(int), 0, (struct sockaddr *)client_addr, clientlen);
+    sendto(server_socket, buffer, strlen(buffer), 0, (struct sockaddr *)client_addr, clientlen);
     perror("File open failed");
     return;
   }
 
-  int sequence_number = 0;
   struct timeval start, end;
   while ((bytes_read = fread(buffer, 1, BUFSIZE, file)) > 0) {
     // Send packet with sequence number
@@ -327,19 +330,19 @@ int main(int argc, char **argv) {
     /* 
      * gethostbyaddr: determine who sent the datagram
      */
-    hostp = gethostbyaddr((const char *)&clientaddr.sin_addr.s_addr, 
-			  sizeof(clientaddr.sin_addr.s_addr), AF_INET);
-    if (hostp == NULL) {
-      error("ERROR on gethostbyaddr\n");
-      exit(1);
-    }
-    hostaddrp = inet_ntoa(clientaddr.sin_addr);
-    if (hostaddrp == NULL) {
-      error("ERROR on inet_ntoa\n");
-      exit(1);
-    }
-    printf("Server received datagram from %s (%s)\n", 
-	  hostp->h_name, hostaddrp);
+    // hostp = gethostbyaddr((const char *)&clientaddr.sin_addr.s_addr, 
+		// 	  sizeof(clientaddr.sin_addr.s_addr), AF_INET);
+    // if (hostp == NULL) {
+    //   error("ERROR on gethostbyaddr\n");
+    //   exit(1);
+    // }
+    // hostaddrp = inet_ntoa(clientaddr.sin_addr);
+    // if (hostaddrp == NULL) {
+    //   error("ERROR on inet_ntoa\n");
+    //   exit(1);
+    // }
+    // printf("Server received datagram from %s (%s)\n", 
+	  // hostp->h_name, hostaddrp);
     printf("Server received %d/%d bytes: %s\n", strlen(buf), n, buf);
 
     /*

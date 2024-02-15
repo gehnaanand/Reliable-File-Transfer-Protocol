@@ -89,21 +89,15 @@ void receive_file(int client_socket, const char *filename, struct sockaddr_in se
 
   snprintf(path, MAX_PATH_LEN, "%s%s", folder, filename);
   FILE *file = fopen(path, "wb");
-  printf("Receive_file\n");
   if (file == NULL) {
     error("File open failed");
     return; 
   }
 
-  // perror("File error\n");
-  printf("File opened\n");
   int expected_sequence_number = 0;
   while (1) {
-    printf("Hello\n");
     int sequence_number;
-    printf("Hello1\n");
     bytes_received = recvfrom(client_socket, &sequence_number, sizeof(int), 0, NULL, NULL);
-    printf("Bytes received - %d\n", bytes_received);
     if (bytes_received <= 0) {
       break;
     }
@@ -120,6 +114,10 @@ void receive_file(int client_socket, const char *filename, struct sockaddr_in se
     memset(buffer, '\0', sizeof(buffer)); 
     bytes_received = recvfrom(client_socket, buffer, BUFSIZE, 0, NULL, NULL);
     // printf("Received buffer - %s\n", buffer);
+    if (strcmp(buffer, "Error: File not found") == 0) {
+      perror("File not found in server");
+      return;
+    }
     if (bytes_received <= 0) {
       break;
     }
