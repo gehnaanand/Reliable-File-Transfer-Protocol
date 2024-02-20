@@ -19,6 +19,75 @@
 #define WINDOW_SIZE 5
 #define TIMEOUT 2 // Timeout in seconds
 
+typedef struct
+{
+  int sequence_number;
+  char data[BUFSIZE];
+  struct timeval sent_time;
+} Packet;
+
+void go_back_n_receive_file1(int server_socket, const char *filename, struct sockaddr_in *client_addr, int clientlen) {
+  char path[MAX_PATH_LEN];
+  const char *folder = "server_folder1/";
+
+  snprintf(path, MAX_PATH_LEN, "%s%s", folder, filename);
+
+  FILE *file = fopen(path, "w");
+  if (!file) {
+    perror("File open failed");
+    return;
+  }
+
+  Packet window[WINDOW_SIZE];
+  int base = 0;
+
+  while (1) {
+    Packet packet;
+    memset(packet.data, '\0', sizeof(packet.data)); 
+    ssize_t packet_len = recvfrom(server_socket, &packet, sizeof(Packet), 0, (struct sockaddr *)&client_addr, &clientlen);
+    if (packet_len < 0) {
+      perror("Recvfrom failed");
+      exit(0);
+    }
+
+    printf("Receiving sequence number %d \n", packet.sequence_number);
+    printf("Received content - %s\n", packet.data);
+
+    if (strcmp(packet.data, "EOF") == 0) {
+      printf("Sending ack for sequence number - %d\n", packet.sequence_number);
+      sendto(server_socket, &packet.sequence_number, sizeof(int), 0, (const struct sockaddr *)&client_addr, clientlen);
+      printf("Done writing \n");
+      break;
+    }
+
+    if (packet.sequence_number >= base && packet.sequence_number < base + WINDOW_SIZE) {
+      // If within the window, store the packet
+      window[packet.sequence_number % WINDOW_SIZE] = packet;
+
+      if (window[base % WINDOW_SIZE].sequence_number < base) {
+        // Send acknowledgment for the received packet
+        printf("Sending ack for already received sequence number - %d\n", packet.sequence_number);
+        sendto(server_socket, &window[base % WINDOW_SIZE].sequence_number, sizeof(int), 0, (const struct sockaddr *)&client_addr, clientlen);
+      }
+
+      // Check if the packet is the next in sequence to be written to the file
+      while (window[base % WINDOW_SIZE].sequence_number == base) {
+        fwrite(window[base % WINDOW_SIZE].data, 1, packet_len - sizeof(int) - sizeof(packet.sent_time), file);
+        // Send acknowledgment for the received packet
+        printf("Sending ack for sequence number - %d\n", window[base % WINDOW_SIZE].sequence_number);
+        sendto(server_socket, &window[base % WINDOW_SIZE].sequence_number, sizeof(int), 0, (const struct sockaddr *)&client_addr, clientlen);
+        base++;
+      }
+
+      // // Send acknowledgment for the received packet
+      // printf("Sending ack for sequence number - %d\n", packet.sequence_number);
+      // sendto(server_socket, &packet.sequence_number, sizeof(int), 0, (const struct sockaddr *)&client_addr, clientlen);
+    }
+  }
+
+  fclose(file);
+}
+
 //PUT command
 void receive_file(int server_socket, const char *filename, struct sockaddr_in *client_addr, int clientlen) {
   char buffer[BUFSIZE];
@@ -364,7 +433,8 @@ int main(int argc, char **argv) {
     } else if (strncmp(command, "put", 3) == 0) {
       printf("Uploading file - %s\n", filename);
       // put(sockfd, (struct sockaddr *)&clientaddr, clientlen, filename);
-      receive_file(sockfd, filename, (struct sockaddr *)&clientaddr, clientlen);
+      // receive_file(sockfd, filename, (struct sockaddr *)&clientaddr, clientlen);
+      go_back_n_receive_file1(sockfd, filename, (struct sockaddr *)&clientaddr, clientlen);
     } else if (strncmp(command, "delete", 6) == 0) {
       printf("Deleting file - %s\n", filename);
       delete(sockfd, (struct sockaddr *)&clientaddr, clientlen, filename);
