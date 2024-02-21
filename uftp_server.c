@@ -13,11 +13,12 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <dirent.h>
+#include <sys/stat.h>
 
 #define BUFSIZE 1024
 #define MAX_PATH_LEN 512
 #define WINDOW_SIZE 5
-#define TIMEOUT 2 // Timeout in seconds
+#define TIMEOUT 1 // Timeout in seconds
 
 typedef struct
 {
@@ -26,303 +27,386 @@ typedef struct
   struct timeval sent_time;
 } Packet;
 
-void go_back_n_receive_file1(int server_socket, const char *filename, struct sockaddr_in *client_addr, int clientlen) {
+/* 
+ * error - wrapper for perror
+ */
+void error(char *msg) {
+  perror(msg);
+  exit(0);
+}
+
+long timeval_diff(struct timeval *start_time, struct timeval *end_time) {
+  return (end_time->tv_sec - start_time->tv_sec) * 1000 + (end_time->tv_usec - start_time->tv_usec) / 1000;
+}
+
+//PUT command
+void go_back_n_receive_file(int server_socket, const char *filename, struct sockaddr_in *client_addr, int clientlen) {
+  const char *dir_name = "server_folder";
+
+  // Check if the directory exists
+  struct stat st;
+  if (stat(dir_name, &st) == -1) {
+    // Directory does not exist, create it
+    if (mkdir(dir_name, 0777) == -1) {
+      perror("mkdir");
+      return; // Error creating directory
+    }
+    printf("Directory created successfully: %s\n", dir_name);
+  } else {
+    printf("Directory already exists: %s\n", dir_name);
+  }
+
   char path[MAX_PATH_LEN];
-  const char *folder = "server_folder1/";
+  const char *folder = "server_folder/";
 
   snprintf(path, MAX_PATH_LEN, "%s%s", folder, filename);
 
-  FILE *file = fopen(path, "w");
+  FILE *file = fopen(path, "wb");
   if (!file) {
     perror("File open failed");
     return;
   }
 
   Packet window[WINDOW_SIZE];
+  for (int i = 0; i < WINDOW_SIZE; i++) {
+    window[i].sequence_number = -1;
+    memset(window[i].data, '\0', sizeof(window[i].data)); 
+  }
+
   int base = 0;
+  int eof = 0;
+  int error = 0;
 
   while (1) {
     Packet packet;
     memset(packet.data, '\0', sizeof(packet.data)); 
-    ssize_t packet_len = recvfrom(server_socket, &packet, sizeof(Packet), 0, (struct sockaddr *)&client_addr, &clientlen);
+    ssize_t packet_len;
+
+    //Wait for sometime (timeout) to check if client asks for acknowledgement again
+    if (eof == 1 || error == 1) {
+      fd_set readfds;
+      FD_ZERO(&readfds);
+      FD_SET(server_socket, &readfds);
+
+      struct timeval timeout;
+      timeout.tv_sec = TIMEOUT;
+      timeout.tv_usec = 0;
+
+      int ready = select(server_socket + 1, &readfds, NULL, NULL, &timeout);
+      printf("Waiting to receive\n");
+      if (ready > 0 && FD_ISSET(server_socket, &readfds)) {
+        packet_len = recvfrom(server_socket, &packet, sizeof(Packet), 0, (struct sockaddr *)&client_addr, &clientlen);
+      } else {
+        printf("Will close\n");
+        break;
+      }
+    } else {
+      packet_len = recvfrom(server_socket, &packet, sizeof(Packet), 0, (struct sockaddr *)&client_addr, &clientlen);
+    }
+
     if (packet_len < 0) {
       perror("Recvfrom failed");
       exit(0);
     }
 
     printf("Receiving sequence number %d \n", packet.sequence_number);
-    printf("Received content - %s\n", packet.data);
+   
+    if (packet.sequence_number == -10) {
+      printf("Received error\n");
+      error = 1;
+    }
 
     if (strcmp(packet.data, "EOF") == 0) {
-      printf("Sending ack for sequence number - %d\n", packet.sequence_number);
-      sendto(server_socket, &packet.sequence_number, sizeof(int), 0, (const struct sockaddr *)&client_addr, clientlen);
-      printf("Done writing \n");
-      break;
+      printf("EOF\n");
+      eof = 1;
     }
 
     if (packet.sequence_number >= base && packet.sequence_number < base + WINDOW_SIZE) {
       // If within the window, store the packet
       window[packet.sequence_number % WINDOW_SIZE] = packet;
-
-      if (window[base % WINDOW_SIZE].sequence_number < base) {
-        // Send acknowledgment for the received packet
-        printf("Sending ack for already received sequence number - %d\n", packet.sequence_number);
-        sendto(server_socket, &window[base % WINDOW_SIZE].sequence_number, sizeof(int), 0, (const struct sockaddr *)&client_addr, clientlen);
-      }
-
+      
       // Check if the packet is the next in sequence to be written to the file
       while (window[base % WINDOW_SIZE].sequence_number == base) {
-        fwrite(window[base % WINDOW_SIZE].data, 1, packet_len - sizeof(int) - sizeof(packet.sent_time), file);
+        if (strcmp(window[base % WINDOW_SIZE].data, "EOF") != 0)
+          fwrite(window[base % WINDOW_SIZE].data, 1, packet_len - sizeof(int) - sizeof(packet.sent_time), file);
         // Send acknowledgment for the received packet
         printf("Sending ack for sequence number - %d\n", window[base % WINDOW_SIZE].sequence_number);
         sendto(server_socket, &window[base % WINDOW_SIZE].sequence_number, sizeof(int), 0, (const struct sockaddr *)&client_addr, clientlen);
         base++;
       }
-
-      // // Send acknowledgment for the received packet
-      // printf("Sending ack for sequence number - %d\n", packet.sequence_number);
-      // sendto(server_socket, &packet.sequence_number, sizeof(int), 0, (const struct sockaddr *)&client_addr, clientlen);
+    } else if (packet.sequence_number < base) {
+      printf("Sending ack for already received sequence number - %d\n", packet.sequence_number);
+      sendto(server_socket, &packet.sequence_number, sizeof(int), 0, (const struct sockaddr *)&client_addr, clientlen);
     }
   }
-
-  fclose(file);
-}
-
-//PUT command
-void receive_file(int server_socket, const char *filename, struct sockaddr_in *client_addr, int clientlen) {
-  char buffer[BUFSIZE];
-  ssize_t bytes_received;
-  char path[MAX_PATH_LEN];
-  const char *folder = "server_folder1/";
-
-  snprintf(path, MAX_PATH_LEN, "%s%s", folder, filename);
-
-  FILE *file = fopen(path, "w");
-  if (!file) {
-    perror("File open failed");
-    return;
+  
+  if (error == 1) {
+    printf("Deleting file due to file error\n");
+    remove(path);
+  } else {
+    printf("Closing\n");
+    fclose(file);
   }
-
-  int expected_sequence_number = 0;
-  while (1) {
-    int sequence_number;
-    bytes_received = recvfrom(server_socket, &sequence_number, sizeof(int), 0, (struct sockaddr *)&client_addr, &clientlen);
-    if (bytes_received <= 0) {
-      break;
-    }
-    printf("Received sequence number - %d\n", sequence_number);
-
-    if (sequence_number != expected_sequence_number) {
-      // Packet loss detected, request retransmission
-      printf("Packet loss detected, request retransmission %d - %d\n", sequence_number, expected_sequence_number);
-      sendto(server_socket, &expected_sequence_number, sizeof(int), 0,
-              (struct sockaddr *)&client_addr, clientlen);
-      continue;
-    }
-
-    memset(buffer, '\0', sizeof(buffer)); 
-    bytes_received = recvfrom(server_socket, buffer, BUFSIZE, 0, (struct sockaddr *)&client_addr, &clientlen);
-    // printf("Received buffer - %s\n", buffer);
-    if (bytes_received <= 0) {
-      break;
-    }
-
-    if (strcmp(buffer, "EOF") == 0)
-      break;
-
-    fwrite(buffer, 1, bytes_received, file);
-    expected_sequence_number = (expected_sequence_number + 1) % WINDOW_SIZE;
-
-    // Send acknowledgment
-    printf("Send Ack for %d\n", sequence_number);
-    printf("Expected sequence number %d\n", expected_sequence_number);
-    sendto(server_socket, &sequence_number, sizeof(int), 0, (struct sockaddr *)&client_addr, clientlen);
-  }
-  printf("Done writing the file \n");
-  // fflush(file);
-  fclose(file);
 }
 
 //GET command
-void send_file(int server_socket, const char *filename, struct sockaddr_in *client_addr, int clientlen) {
-  char buffer[BUFSIZE];
-  ssize_t bytes_read;
+void go_back_n_send_file(int server_socket, const char *filename, struct sockaddr_in client_addr, int clientlen) {
   char path[MAX_PATH_LEN];
-  const char *folder = "server_folder1/";
+  const char *folder = "server_folder/";
 
   snprintf(path, MAX_PATH_LEN, "%s%s", folder, filename);
-
-  int sequence_number = 0;
-  FILE *file = fopen(path, "rb");
-  if (!file) {
-    snprintf(buffer, BUFSIZE, "Error: File not found");
-    sendto(server_socket, &sequence_number, sizeof(int), 0, (struct sockaddr *)client_addr, clientlen);
-    sendto(server_socket, buffer, strlen(buffer), 0, (struct sockaddr *)client_addr, clientlen);
-    perror("File open failed");
-    return;
+  FILE *file = fopen(filename, "rb");
+  int file_error = 0;
+  if (file == NULL) {
+    file_error = 1;
+    perror("File not found \n");
+    // exit(0);
   }
+  
+  Packet window[WINDOW_SIZE];
+  int base = 0, nextseqnum = 0;
+  int eof = 0;
+  int error_sent = 0;
 
-  struct timeval start, end;
-  while ((bytes_read = fread(buffer, 1, BUFSIZE, file)) > 0) {
-    // Send packet with sequence number
-    printf("Send sequence number - %d \n", sequence_number);
-    printf("Send content - %s \n", buffer);
-    sendto(server_socket, &sequence_number, sizeof(int), 0, (struct sockaddr *)client_addr, clientlen);
-    sendto(server_socket, buffer, bytes_read, 0, (struct sockaddr *)client_addr, clientlen);
-
-    // Start timer
-    gettimeofday(&start, NULL);
-
-    // Wait for acknowledgment or timeout
-    int ack_received = 0;
-    while (!ack_received) {
-      gettimeofday(&end, NULL);
-      double elapsed_time = (end.tv_sec - start.tv_sec) + ((end.tv_usec - start.tv_usec) / 1000000.0);
-      if (elapsed_time >= TIMEOUT) {
-        printf("Timeout occurred for packet %d. Retransmitting...\n", sequence_number);
-        sendto(server_socket, &sequence_number, sizeof(int), 0, (struct sockaddr *)client_addr, clientlen);
-        sendto(server_socket, buffer, bytes_read, 0, (struct sockaddr *)client_addr, clientlen);
-        gettimeofday(&start, NULL); // Restart timer
+  while (1) {
+    // Send packets within the window
+    while (nextseqnum < base + WINDOW_SIZE && eof == 0 && error_sent == 0) {
+      Packet packet;
+      if (file_error == 1) {
+        packet.sequence_number = -10;
+        memcpy(packet.data, "File not found", strlen("File not found"));
+        gettimeofday(&packet.sent_time, NULL);
+        sendto(server_socket, &packet, strlen("File not found") + sizeof(int) + sizeof(packet.sent_time), 0, (const struct sockaddr *)&client_addr, clientlen);
+        nextseqnum++;
+        window[0] = packet;
+        error_sent = 1;
+        break;
       }
 
-      // Check for acknowledgment
-      fd_set readfds;
-      FD_ZERO(&readfds);
-      FD_SET(server_socket, &readfds);
+      packet.sequence_number = nextseqnum;
 
-      struct timeval timeout;
-      timeout.tv_sec = TIMEOUT - elapsed_time;
-      timeout.tv_usec = 0;
+      memset(packet.data, '\0', BUFSIZE); 
+      ssize_t bytes_read = fread(packet.data, 1, BUFSIZE, file);
 
-      int ready = select(server_socket + 1, &readfds, NULL, NULL, &timeout);
-      if (ready > 0 && FD_ISSET(server_socket, &readfds)) {
-        int ack;
-        if (recvfrom(server_socket, &ack, sizeof(int), 0, NULL, NULL) > 0 && ack == sequence_number) {
-          printf("Ack received - %d \n", sequence_number);
-          ack_received = 1;
-        }
+      // End of file
+      if (bytes_read <= 0) {
+        printf("EOF\n");
+        memset(packet.data, '\0', BUFSIZE); 
+        memcpy(packet.data, "EOF", 3); 
+        // Set transmission time for the packet
+        gettimeofday(&packet.sent_time, NULL);
+        printf("Sending sequence number - %d\n", packet.sequence_number);
+        // printf("Sending content - %s\n", packet.data);
+        sendto(server_socket, &packet, bytes_read + sizeof(int) + sizeof(packet.sent_time), 0, (const struct sockaddr *)&client_addr, clientlen);
+        nextseqnum++;
+        window[packet.sequence_number % WINDOW_SIZE] = packet;
+        eof = 1;
+        break; 
+      }
+
+      // Set transmission time for the packet
+      gettimeofday(&packet.sent_time, NULL);
+      printf("Sending sequence number - %d\n", packet.sequence_number);
+      // printf("Sending content - %s\n", packet.data);
+      sendto(server_socket, &packet, bytes_read + sizeof(int) + sizeof(packet.sent_time), 0, (const struct sockaddr *)&client_addr, clientlen);
+      nextseqnum++;
+
+      // Store the packet in the window for retransmission if needed
+      window[packet.sequence_number % WINDOW_SIZE] = packet;
+    }
+
+    // Check for timeout on each packet in the window
+    struct timeval current_time;
+    gettimeofday(&current_time, NULL);
+
+    // printf("Checking timeout for sequence number - %d\n", window[base % WINDOW_SIZE].sequence_number);
+    long elapsed_time = timeval_diff(&window[base % WINDOW_SIZE].sent_time, &current_time);
+    // printf("Sent time - %ld, Current time - %ld\n", window[base % WINDOW_SIZE].sent_time.tv_sec, current_time.tv_sec);
+    // printf("Checking timeout for sequence number - %d ==> %ld\n", window[base % WINDOW_SIZE].sequence_number, elapsed_time);
+    if (elapsed_time >= TIMEOUT * 1000) {
+      for (int i = base; i < nextseqnum; i++) {
+        Packet *packet = &window[i % WINDOW_SIZE];
+        
+        // Timeout occurred, retransmit the packet
+        printf("Timeout occurred for sequence number %d, retransmitting...\n", packet->sequence_number);
+        sendto(server_socket, packet, sizeof(packet->data) + sizeof(int) + sizeof(packet->sent_time), 0, (const struct sockaddr *)&client_addr, clientlen);
+        gettimeofday(&packet->sent_time, NULL); // Update transmission time
       }
     }
 
-    // Move to the next sequence number
-    sequence_number = (sequence_number + 1) % WINDOW_SIZE;
-    printf("Advance to next sequence number %d \n", sequence_number);
+    // Receive acknowledgment
+    int ack_number;
+    ssize_t ack_len = recvfrom(server_socket, &ack_number, sizeof(int), MSG_DONTWAIT, (struct sockaddr *)&client_addr, &clientlen);
+    if (ack_len > 0) {
+      printf("Received acknowledgment for sequence number = %d\n", ack_number);
+
+      if (ack_number == -10)
+        break;
+
+      // Move base forward
+      while (base <= ack_number) {
+        base++;
+      }
+    }
+
+    // Check for completion
+    if (base >= nextseqnum) {
+      break; // All packets have been acknowledged
+    }
   }
-  printf("EOF\n");
-  sendto(server_socket, &sequence_number, sizeof(int), 0, (struct sockaddr *)client_addr, clientlen);
-  sendto(server_socket, "EOF", 3, 0, (struct sockaddr *)client_addr, clientlen);
-  fclose(file);
-}
-/*
- * error - wrapper for perror
- */
-void error(char *msg) {
-  perror(msg);
-  exit(1);
-}
 
-void get(int sockfd, struct sockaddr_in *client_addr, int clientlen, char *filename) {
-  FILE *file;
-  char buffer[BUFSIZE];
-  ssize_t bytes_read;
-  char path[MAX_PATH_LEN];
-  const char *folder = "server_folder/";
-  
-  snprintf(path, MAX_PATH_LEN, "%s%s", folder, filename);
-
-  file = fopen(path, "r");
-  
-  if (file == NULL) {
-    perror("File not found");
-    snprintf(buffer, BUFSIZE, "Error: File not found");
-    sendto(sockfd, buffer, strlen(buffer), 0, (struct sockaddr *)client_addr, clientlen);
+  if (file_error == 1)
     return;
-  }
-  
-  while ((bytes_read = fread(buffer, 1, BUFSIZE, file)) > 0) {
-    sendto(sockfd, buffer, bytes_read, 0, (struct sockaddr *)client_addr, clientlen);
-  }
-  
-  sendto(sockfd, "EOF", 3, 0, (struct sockaddr *)client_addr, clientlen);
-  fclose(file);
-  printf("Sent successfully to client\n");
-}
 
-void put(int sockfd, struct sockaddr_in *client_addr, int clientlen, char *filename) {
-  FILE *file;
-  char buffer[BUFSIZE];
-  ssize_t bytes_written;
-  char path[MAX_PATH_LEN];
-  const char *folder = "server_folder/";
-
-  snprintf(path, MAX_PATH_LEN, "%s%s", folder, filename);
-  file = fopen(path, "wb");
-  if (file == NULL) {
-    snprintf(buffer, BUFSIZE, "Error: Could not create file");
-    sendto(sockfd, buffer, strlen(buffer), 0, (struct sockaddr *)client_addr, clientlen);
-    return;
-  }
-
-  while (1) {
-    printf("Writing \n");
-    memset(buffer, '\0', sizeof(buffer)); 
-    ssize_t bytes_received = recvfrom(sockfd, buffer, BUFSIZE, 0, NULL, NULL);
-    printf("Buffer - %s\n", buffer);
-    // if (bytes_received <= 0) {
-    //   break;
-    // }
-    
-    // if (bytes_written < bytes_received) {
-    //   break;
-    // }
-    if (strcmp(buffer, "EOF") == 0)
-      break;
-    
-    bytes_written = fwrite(buffer, 1, bytes_received, file);
-  }
-  printf("Got file from client\n");
   fclose(file);
 }
 
-void delete(int sockfd, struct sockaddr_in *client_addr, int clientlen, char *filename) {
-  char path[MAX_PATH_LEN];
-  const char *folder = "server_folder1/";
-  snprintf(path, MAX_PATH_LEN, "%s%s", folder, filename);
-  if (remove(path) == 0) {
-    printf("Deleted successfully\n");
-    sendto(sockfd, "File deleted successfully", 25, 0, (struct sockaddr *)client_addr, clientlen);
-  } else {
-    printf("Deletion error\n");
-    sendto(sockfd, "Error: File not found", 21, 0, (struct sockaddr *)client_addr, clientlen);
-  }
-}
-
-void ls(int sockfd, struct sockaddr_in *client_addr, int clientlen) {
+void ls(int server_socket, struct sockaddr_in client_addr, int clientlen) {
   DIR *dir;
   struct dirent *entry;
-  char buffer[BUFSIZE] = "";
 
-  dir = opendir("server_folder1");
+  dir = opendir("server_folder");
   if (dir == NULL) {
-    sendto(sockfd, "Error: Unable to read directory", 31, 0, (struct sockaddr *) client_addr, clientlen);
+    Packet packet;
+    packet.sequence_number = -10;
+    memcpy(packet.data, "Error: Unable to read directory", strlen("Error: Unable to read directory"));
+    gettimeofday(&packet.sent_time, NULL);
+    sendto(server_socket, &packet, 31, 0, (struct sockaddr *)&client_addr, clientlen);
     return;
   }
 
-  while ((entry = readdir(dir)) != NULL) {
-    if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
-      continue; // Skip current directory and parent directory entries
-      
-    memset(buffer, 0, BUFSIZE); // Reset buffer before each use
-    strncpy(buffer, entry->d_name, BUFSIZE - 1); 
-    strcat(buffer, "\n"); 
-    sendto(sockfd, buffer, strlen(buffer), 0, client_addr, clientlen);
-    printf("Sending file - %s", buffer);
+  Packet window[WINDOW_SIZE];
+  int base = 0, nextseqnum = 0;
+  int eof = 0;
+
+  while (1) {
+    // Send packets within the window
+    while (nextseqnum < base + WINDOW_SIZE && eof == 0) {
+      Packet packet;
+      packet.sequence_number = nextseqnum;
+
+      memset(packet.data, '\0', BUFSIZE); 
+      entry = readdir(dir);
+
+      // End of file
+      if (entry == NULL) {
+        printf("EOF\n");
+        memset(packet.data, '\0', BUFSIZE); 
+        memcpy(packet.data, "EOF", 3); 
+        // Set transmission time for the packet
+        gettimeofday(&packet.sent_time, NULL);
+        printf("Sending sequence number - %d\n", packet.sequence_number);
+        // printf("Sending content - %s\n", packet.data);
+        sendto(server_socket, &packet, strlen(packet.data) + sizeof(int) + sizeof(packet.sent_time), 0, (const struct sockaddr *)&client_addr, clientlen);
+        nextseqnum++;
+        window[packet.sequence_number % WINDOW_SIZE] = packet;
+        eof = 1;
+        break; 
+      }
+
+      if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
+        continue;  // Skip current directory and parent directory entries
+
+      strncpy(&packet.data, entry->d_name, BUFSIZE - 1); 
+      strcat(&packet.data, "\n"); 
+
+      // Set transmission time for the packet
+      gettimeofday(&packet.sent_time, NULL);
+      printf("Sending sequence number - %d\n", packet.sequence_number);
+      printf("Sending content - %s\n", packet.data);
+      sendto(server_socket, &packet, strlen(packet.data) + sizeof(int) + sizeof(packet.sent_time), 0, (const struct sockaddr *)&client_addr, clientlen);
+      nextseqnum++;
+
+      // Store the packet in the window for retransmission if needed
+      window[packet.sequence_number % WINDOW_SIZE] = packet;
+    }
+
+    // Check for timeout on each packet in the window
+    struct timeval current_time;
+    gettimeofday(&current_time, NULL);
+
+    long elapsed_time = timeval_diff(&window[base % WINDOW_SIZE].sent_time, &current_time);
+    if (elapsed_time >= TIMEOUT * 1000) {
+      for (int i = base; i < nextseqnum; i++) {
+        Packet *packet = &window[i % WINDOW_SIZE];
+        
+        // Timeout occurred, retransmit the packet
+        printf("Timeout occurred for sequence number %d, retransmitting...\n", packet->sequence_number);
+        sendto(server_socket, packet, strlen(packet->data) + sizeof(int) + sizeof(packet->sent_time), 0, (const struct sockaddr *)&client_addr, clientlen);
+        gettimeofday(&packet->sent_time, NULL); // Update transmission time
+      }
+    }
+
+    // Receive acknowledgment
+    int ack_number;
+    ssize_t ack_len = recvfrom(server_socket, &ack_number, sizeof(int), MSG_DONTWAIT, (struct sockaddr *)&client_addr, &clientlen);
+    if (ack_len > 0) {
+      printf("Received acknowledgment for sequence number = %d\n", ack_number);
+
+      // Move base forward
+      while (base <= ack_number) {
+        base++;
+      }
+    }
+
+    // Check for completion
+    if (base >= nextseqnum) {
+      break; // All packets have been acknowledged
+    }
   }
 
   closedir(dir);
-  sendto(sockfd, "EOF", strlen("EOF"), 0, (struct sockaddr *) client_addr, clientlen);
-  
 }
+
+//DELETE command
+void delete(int sockfd, struct sockaddr_in client_addr, int clientlen, char *filename) {
+  char path[MAX_PATH_LEN];
+  const char *folder = "server_folder/";
+  snprintf(path, MAX_PATH_LEN, "%s%s", folder, filename);
+  char buffer[BUFSIZE];
+  memset(buffer, '\0', BUFSIZE); 
+  if (remove(path) == 0) {
+    memcpy(buffer, "File deleted successfully", strlen("File deleted successfully")); 
+    printf("File deleted successfully\n");
+  } else {
+    memcpy(buffer, "Error: File not found", strlen("Error: File not found")); 
+    printf("Deletion error\n");
+    // sendto(sockfd, "Error: File not found", 21, 0, (struct sockaddr *)client_addr, clientlen);
+  }
+
+  sendto(sockfd, buffer, strlen(buffer), 0, (struct sockaddr *)&client_addr, clientlen);
+  
+  int ack = 0;
+
+  while (1) {
+    fd_set readfds;
+    FD_ZERO(&readfds);
+    FD_SET(sockfd, &readfds);
+
+    struct timeval timeout;
+    timeout.tv_sec = TIMEOUT;
+    timeout.tv_usec = 0;
+
+    int n;
+    int ready = select(sockfd + 1, &readfds, NULL, NULL, &timeout);
+    printf("Waiting to receive ack\n");
+    if (ready > 0 && FD_ISSET(sockfd, &readfds)) {
+      n = recvfrom(sockfd, &ack, sizeof(int), 0, (struct sockaddr *)&client_addr, &clientlen);
+      if (n < 0)
+        error("Error in recvfrom\n");
+      
+      if (ack == 1) {
+        printf("Received ack\n");
+        break;
+      }
+    } else {
+      //Retransmit the status
+      printf("Retransmitting status\n");
+      sendto(sockfd, buffer, strlen(buffer), 0, (struct sockaddr *)&client_addr, clientlen);
+    } 
+  }
+}
+
 
 int main(int argc, char **argv) {
   int sockfd; /* socket */
@@ -396,31 +480,16 @@ int main(int argc, char **argv) {
       exit(1);
     }
 
-    /* 
-     * gethostbyaddr: determine who sent the datagram
-     */
-    // hostp = gethostbyaddr((const char *)&clientaddr.sin_addr.s_addr, 
-		// 	  sizeof(clientaddr.sin_addr.s_addr), AF_INET);
-    // if (hostp == NULL) {
-    //   error("ERROR on gethostbyaddr\n");
-    //   exit(1);
-    // }
-    // hostaddrp = inet_ntoa(clientaddr.sin_addr);
-    // if (hostaddrp == NULL) {
-    //   error("ERROR on inet_ntoa\n");
-    //   exit(1);
-    // }
-    // printf("Server received datagram from %s (%s)\n", 
-	  // hostp->h_name, hostaddrp);
     printf("Server received %d/%d bytes: %s\n", strlen(buf), n, buf);
+    int ack = 1;
+    int n1;
+    n1 = sendto(sockfd, &ack, sizeof(int), 0, (const struct sockaddr *)&clientaddr, clientlen);
+    if (n1 < 0)
+      error("ERROR in sendto\n");
 
     /*
     * Get the command 
     */
-    // char *command = strtok(buf, " ");
-    // char *filename = strtok(NULL, " ");
-    // printf("Command: %s \n", command);
-    // printf("File name: %s \n", filename);
     char command[50];
     char filename[50];
     
@@ -428,30 +497,20 @@ int main(int argc, char **argv) {
     
     if (strncmp(command, "get", 3) == 0) {
       printf("Getting file - %s\n", filename);
-      // get(sockfd, (struct sockaddr *)&clientaddr, clientlen, filename);
-      send_file(sockfd, filename, (struct sockaddr *)&clientaddr, clientlen);
+      go_back_n_send_file(sockfd, filename, clientaddr, clientlen);
     } else if (strncmp(command, "put", 3) == 0) {
       printf("Uploading file - %s\n", filename);
-      // put(sockfd, (struct sockaddr *)&clientaddr, clientlen, filename);
-      // receive_file(sockfd, filename, (struct sockaddr *)&clientaddr, clientlen);
-      go_back_n_receive_file1(sockfd, filename, (struct sockaddr *)&clientaddr, clientlen);
+      go_back_n_receive_file(sockfd, filename, (struct sockaddr *)&clientaddr, clientlen);
     } else if (strncmp(command, "delete", 6) == 0) {
       printf("Deleting file - %s\n", filename);
-      delete(sockfd, (struct sockaddr *)&clientaddr, clientlen, filename);
+      delete(sockfd, clientaddr, clientlen, filename);
     } else if (strncmp(command, "ls", 2) == 0) {
       printf("Listing all files\n");
-      ls(sockfd, (struct sockaddr *)&clientaddr, clientlen);
+      ls(sockfd, clientaddr, clientlen);
     } else if (strncmp(command, "exit", 4) == 0) {
       printf("Client is exiting\n");
       break;
     }
-    /* 
-     * sendto: echo the input back to the client 
-     */
-    // n = sendto(sockfd, buf, strlen(buf), 0, 
-	  //      (struct sockaddr *) &clientaddr, clientlen);
-    // if (n < 0) 
-    //   error("ERROR in sendto");
   }
 
   close(sockfd);
