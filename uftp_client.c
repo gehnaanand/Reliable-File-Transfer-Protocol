@@ -474,7 +474,48 @@ int main(int argc, char **argv) {
     } else if (sscanf(buf, "%s", command) == 1) {
       if (strncmp(command, "exit", 4) == 0) {
         send_command(sockfd, buf, &serveraddr, serverlen);
-        break;
+        char buffer[BUFSIZE];
+        int a = 1;
+        while (1) {
+          fd_set readfds;
+          FD_ZERO(&readfds);
+          FD_SET(sockfd, &readfds);
+
+          struct timeval timeout;
+          timeout.tv_sec = 2;
+          timeout.tv_usec = 0;
+
+          int ready = select(sockfd + 1, &readfds, NULL, NULL, &timeout);
+          // printf("Waiting to receive\n");
+          if (ready > 0 && FD_ISSET(sockfd, &readfds)) {
+            // Setting timeout
+            // gettimeofday(&end, NULL);
+            // global_timeout = timeval_diff(&start, &end); //In seconds
+            // printf("Setting timeout - %ld\n", global_timeout);
+            // if (global_timeout == 0)
+            //   global_timeout = 500;
+            // else
+            //   global_timeout = global_timeout*2;
+            // printf("Setting timeout - %ld\n", global_timeout);
+
+            n = recvfrom(sockfd, &buffer, BUFSIZE, 0, NULL, NULL);
+            if (n < 0) 
+              error("ERROR in recvfrom \n");
+            
+            printf("%s\n", buffer);
+            break;
+              
+            
+            // printf("Sending command again\n");
+            // sendto(sockfd, buf, strlen(buf), 0, (const struct sockaddr *)serveraddr, serverlen);
+          } else {
+            // printf("Will close\n");
+            break;
+          }
+        }
+        if (a == 1)
+          break;
+        
       } else if (strncmp(command, "ls", 2) == 0) {
         send_command(sockfd, buf, &serveraddr, serverlen);
         ls(sockfd, &serveraddr, serverlen);

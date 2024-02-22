@@ -508,6 +508,7 @@ int main(int argc, char **argv) {
       printf("Listing all files\n");
       ls(sockfd, clientaddr, clientlen);
     } else if (strncmp(command, "exit", 4) == 0) {
+      sendto(sockfd, "Goodbye", strlen("Goodbye"), 0, (const struct sockaddr *)&clientaddr, clientlen);
       printf("Client is exiting\n");
       break;
     }
